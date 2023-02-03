@@ -9,6 +9,8 @@
 #include <net/tcp.h>
 #include <net/psp/types.h>
 
+#include <trace/events/tcp.h>
+
 struct inet_timewait_sock;
 
 /* Driver-facing API */
@@ -93,6 +95,8 @@ static inline enum skb_drop_reason
 __psp_sk_rx_policy_check(struct sk_buff *skb, struct psp_assoc *pas)
 {
 	struct psp_skb_ext *pse = skb_ext_find(skb, SKB_EXT_PSP);
+
+	trace_psp_rx_policy_check(pse, pas);
 
 	if (!pas)
 		return pse ? SKB_DROP_REASON_PSP_INPUT : 0;
