@@ -7,3 +7,4 @@ from .nsim import *
 from .utils import *
 from .ynl import NlError, YnlFamily, EthtoolFamily, NetdevFamily, RtnlFamily, RtnlAddrFamily
 from .ynl import NetshaperFamily, DevlinkFamily
+from .ynl import NetshaperFamily, PSPFamily

@@ -18,6 +18,7 @@ TEST_PROGS := \
 	netcons_sysdata.sh \
 	netpoll_basic.py \
 	ping.py \
+	psp.py \
 	queues.py \
 	stats.py \
 	shaper.py \
