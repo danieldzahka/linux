@@ -1,2 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
 napi_id_helper
+tools/
+psp_responder
+xdp_helper
