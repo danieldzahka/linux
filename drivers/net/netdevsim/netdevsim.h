@@ -122,6 +122,7 @@ struct netdevsim {
 		struct psp_dev *dev;
 		u32 spi;
 		u32 assoc_cnt;
+		int generation;
 	} psp;
 
 	struct nsim_bus_dev *nsim_bus_dev;
@@ -439,17 +440,28 @@ static inline void nsim_macsec_teardown(struct netdevsim *ns)
 #if IS_ENABLED(CONFIG_INET_PSP)
 int nsim_psp_init(struct netdevsim *ns);
 void nsim_psp_uninit(struct netdevsim *ns);
-enum skb_drop_reason
-nsim_do_psp(struct sk_buff *skb, struct netdevsim *ns,
-	    struct netdevsim *peer_ns, struct skb_ext **psp_ext);
+enum skb_drop_reason nsim_do_psp(struct sk_buff *skb, struct netdevsim *ns,
+				 struct netdevsim *peer_ns);
+bool nsim_rx_skb_is_psp(struct sk_buff *skb, u32 ver_ena);
+int nsim_psp_handle_rx_skb(struct sk_buff *skb, struct netdevsim *ns);
 #else
 static inline int nsim_psp_init(struct netdevsim *ns) { return 0; }
 static inline void nsim_psp_uninit(struct netdevsim *ns) {}
-static inline enum skb_drop_reason
-nsim_do_psp(struct sk_buff *skb, struct netdevsim *ns,
-	    struct netdevsim *peer_ns, struct skb_ext **psp_ext)
+static inline enum skb_drop_reason nsim_do_psp(struct sk_buff *skb,
+					       struct netdevsim *ns,
+					       struct netdevsim *peer_ns)
 {
 	return 0;
+}
+
+static inline bool nsim_rx_skb_is_psp(struct sk_buff *skb, u32 ver_ena)
+{
+	return false;
+}
+
+static inline int nsim_psp_handle_rx_skb(struct sk_buff *skb, struct netdevsim *ns)
+{
+	return -1;
 }
 #endif
 

@@ -112,7 +112,6 @@ static int nsim_forward_skb(struct net_device *tx_dev,
 static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct netdevsim *ns = netdev_priv(dev);
-	struct skb_ext *psp_ext = NULL;
 	struct net_device *peer_dev;
 	unsigned int len = skb->len;
 	struct netdevsim *peer_ns;
@@ -130,7 +129,7 @@ static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev)
 		goto out_drop_any;
 
 	if (skb->decrypted) {
-		dr = nsim_do_psp(skb, ns, peer_ns, &psp_ext);
+		dr = nsim_do_psp(skb, ns, peer_ns);
 		if (dr)
 			goto out_drop_free;
 	}
@@ -394,7 +393,7 @@ static int nsim_get_iflink(const struct net_device *dev)
 	return iflink;
 }
 
-static int nsim_rcv(struct nsim_rq *rq, int budget)
+static int nsim_rcv(struct nsim_rq *rq, int budget, struct netdevsim *ns)
 {
 	struct net_device *dev = rq->napi.dev;
 	struct bpf_prog *xdp_prog;
@@ -428,6 +427,13 @@ static int nsim_rcv(struct nsim_rq *rq, int budget)
 		/* skb might be discard at netif_receive_skb, save the len */
 		skblen = skb->len;
 		skb_mark_napi_id(skb, &rq->napi);
+		if (nsim_rx_skb_is_psp(skb, ns->psp.dev->config.versions)) {
+			if (nsim_psp_handle_rx_skb(skb, ns)) {
+				kfree_skb(skb);
+				continue;
+			}
+		}
+
 		ret = netif_receive_skb(skb);
 		if (ret == NET_RX_SUCCESS)
 			dev_dstats_rx_add(dev, skblen);
@@ -442,9 +448,10 @@ static int nsim_rcv(struct nsim_rq *rq, int budget)
 static int nsim_poll(struct napi_struct *napi, int budget)
 {
 	struct nsim_rq *rq = container_of(napi, struct nsim_rq, napi);
+	struct netdevsim *ns = netdev_priv(napi->dev);
 	int done;
 
-	done = nsim_rcv(rq, budget);
+	done = nsim_rcv(rq, budget, ns);
 	if (done < budget)
 		napi_complete_done(napi, done);
 

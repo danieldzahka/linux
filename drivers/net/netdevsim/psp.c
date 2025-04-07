@@ -5,49 +5,70 @@
 
 #include "netdevsim.h"
 
-MODULE_IMPORT_NS("NETDEV_INTERNAL");
-
 struct psp_insert {
 	struct udphdr udp;
 	struct psphdr psp;
 };
 
-enum skb_drop_reason
-nsim_do_psp(struct sk_buff *skb, struct netdevsim *ns,
-	    struct netdevsim *peer_ns, struct skb_ext **psp_ext)
+enum skb_drop_reason nsim_do_psp(struct sk_buff *skb, struct netdevsim *ns,
+				 struct netdevsim *peer_ns)
 {
-	struct psp_skb_ext *pse;
 	struct psp_insert *psp;
 	struct psp_assoc *pas;
+	struct ipv6hdr *ip6;
 	unsigned int offs;
 	void *start;
 	void **ptr;
+	int rc = 0;
 	int err;
 
+	rcu_read_lock();
 	pas = psp_skb_get_assoc_rcu(skb);
 	if (likely(!pas))
-		return 0;
+		goto out_unlock;
 
-	if (!skb_transport_header_was_set(skb))
-		return SKB_DROP_REASON_PSP_OUTPUT;
+	if (skb->protocol != htons(ETH_P_IPV6)) {
+		rc = SKB_DROP_REASON_PSP_OUTPUT;
+		goto out_unlock;
+	}
+
+	if (!skb_transport_header_was_set(skb)) {
+		rc = SKB_DROP_REASON_PSP_OUTPUT;
+		goto out_unlock;
+	}
 
 	ptr = psp_assoc_drv_data(pas);
 	if (*ptr != ns) {
 		pr_err_ratelimited("drv priv mismatch %px != %px\n", *ptr, ns);
-		return SKB_DROP_REASON_PSP_OUTPUT;
+		rc = SKB_DROP_REASON_PSP_OUTPUT;
+		goto out_unlock;
 	}
 
-	/* Fake inserting the headers */
 	err = skb_cow_head(skb, sizeof(*psp));
-	if (err < 0)
-		return SKB_DROP_REASON_NOMEM;
+	if (err < 0) {
+		rc = SKB_DROP_REASON_NOMEM;
+		goto out_unlock;
+	}
 
 	offs = skb_transport_offset(skb);
 
 	start = skb_push(skb, sizeof(*psp));
+	skb->mac_header		-= sizeof(*psp);
+	skb->network_header	-= sizeof(*psp);
+	skb->transport_header	-= sizeof(*psp);
+
 	psp = start + offs;
 
 	memmove(start, start + sizeof(*psp), offs);
+
+	ip6 = ipv6_hdr(skb);
+	skb_set_inner_ipproto(skb, IPPROTO_TCP);
+	ip6->nexthdr = IPPROTO_UDP;
+	be16_add_cpu(&ip6->payload_len, sizeof(*psp));
+
+	skb_set_inner_transport_header(skb, skb_transport_offset(skb) +
+						    sizeof(*psp));
+	skb->encapsulation = 1;
 
 	psp->udp.source = htons(1234);
 	psp->udp.dest = htons(PSP_DEFAULT_UDP_PORT);
@@ -62,75 +83,91 @@ nsim_do_psp(struct sk_buff *skb, struct netdevsim *ns,
 	psp->psp.spi = pas->tx.spi;
 	psp->psp.iv = cpu_to_be64(sched_clock());
 
-	/* Now pretend we just received this frame */
-	if (peer_ns->psp.dev->config.versions & (1 << pas->version)) {
-		skb_pull(skb, sizeof(*psp));
-		memmove(skb->data, start, offs);
-
-		skb->decrypted = 1;
-		/* Allocate a fresh ext which has only PSP in it.
-		 * skb_scrub_packet() would reset the old ext, anyway.
-		 */
-		skb_ext_reset(skb);
-		pse = skb_ext_add(skb, SKB_EXT_PSP);
-		if (!pse)
-			return SKB_DROP_REASON_NOMEM;
-		*psp_ext = skb->extensions;
-		refcount_inc(&(*psp_ext)->refcnt);
-
-		pse->spi = pas->tx.spi;
-		/* We cheat a bit and put the generation in the key.
-		 * In real life if generation was too old decrypt would fail
-		 * here because device key is out of the picture.
-		 */
-		pse->generation = pas->tx.key[0];
-		pse->version = pas->version;
-
-		u64_stats_update_begin(&peer_ns->syncp);
-		peer_ns->psp.rx_packets++;
-		peer_ns->psp.rx_bytes += skb->len - ETH_HLEN;
-		u64_stats_update_end(&peer_ns->syncp);
-	} else {
-		struct ipv6hdr *ip6h;
-		struct iphdr *iph;
-		__wsum csum;
-
-		skb->mac_header		-= sizeof(*psp);
-		skb->network_header	-= sizeof(*psp);
-		skb->transport_header	-= sizeof(*psp);
-
-		csum = skb_checksum(skb, skb_transport_offset(skb),
-				    ntohs(psp->udp.len), 0);
-
-		switch (skb->protocol) {
-		case htons(ETH_P_IP):
-			iph = ip_hdr(skb);
-			iph->protocol = IPPROTO_UDP;
-			be16_add_cpu(&iph->tot_len, sizeof(*psp));
-			ip_send_check(iph);
-			psp->udp.check = udp_v4_check(ntohs(psp->udp.len),
-						      iph->saddr,
-						      iph->daddr, csum);
-			break;
-#if IS_ENABLED(CONFIG_IPV6)
-		case htons(ETH_P_IPV6):
-			ip6h = ipv6_hdr(skb);
-			ip6h->nexthdr =	IPPROTO_UDP;
-			be16_add_cpu(&ip6h->payload_len, sizeof(*psp));
-			psp->udp.check = udp_v6_check(ntohs(psp->udp.len),
-						      &ip6h->saddr,
-						      &ip6h->daddr, csum);
-			break;
-#endif
-		}
-
-		psp->udp.check	= psp->udp.check ?: CSUM_MANGLED_0;
-		skb->ip_summed	= CHECKSUM_NONE;
-	}
-
 	u64_stats_update_begin(&ns->syncp);
 	ns->psp.tx_packets++;
 	ns->psp.tx_bytes += skb->len - ETH_HLEN;
+	u64_stats_update_end(&ns->syncp);
+
+out_unlock:
+	rcu_read_unlock();
+	return rc;
+}
+
+bool nsim_rx_skb_is_psp(struct sk_buff *skb, u32 ver_ena)
+{
+	int header_len = sizeof(struct ipv6hdr) + sizeof(struct psp_insert);
+	const struct udphdr *uh;
+	const struct psphdr *ph;
+
+	if (skb->protocol != htons(ETH_P_IPV6))
+		return false;
+
+	if (header_len > skb_headlen(skb))
+		return false;
+
+	if (ipv6_hdr(skb)->nexthdr != IPPROTO_UDP)
+		return false;
+
+	uh = (const struct udphdr *)(skb->data + sizeof(struct ipv6hdr));
+	if (uh->dest != htons(PSP_DEFAULT_UDP_PORT))
+		return false;
+
+	ph = (const struct psphdr *)(uh + 1);
+	if (ph->nexthdr != IPPROTO_TCP)
+		return false;
+
+	/* PACKETDRILL HACK: the wire_server needs to see non-decapsulated PSP
+	 * packets on its packet socket. To do this, we disable all PSP
+	 * versions on the wire_server netdevsim, and include the branch below
+	 * instead of dropping the packet.
+	 */
+	if (!((1 << FIELD_GET(PSPHDR_VERFL_VERSION, ph->verfl)) & ver_ena))
+		return false;
+
+	return true;
+}
+
+int nsim_psp_handle_rx_skb(struct sk_buff *skb, struct netdevsim *ns)
+{
+	const struct psphdr *psph;
+	int depth = 0, end_depth;
+	struct psp_skb_ext *pse;
+	struct ipv6hdr *ipv6h;
+	u32 spi;
+
+	ipv6h = (struct ipv6hdr *)skb->data;
+	depth = sizeof(*ipv6h);
+	end_depth = depth + sizeof(struct udphdr) + sizeof(struct psphdr);
+
+	if (unlikely(end_depth > skb_headlen(skb)))
+		return -EINVAL;
+
+	pse = skb_ext_add(skb, SKB_EXT_PSP);
+	if (!pse)
+		return -EINVAL;
+
+	psph = (const struct psphdr *)(skb->data + depth +
+				       sizeof(struct udphdr));
+	pse->spi = psph->spi;
+	pse->dev_id = ns->psp.dev->id;
+	spi = ntohl(psph->spi);
+	pse->generation = 0;
+	pse->version = FIELD_GET(PSPHDR_VERFL_VERSION, psph->verfl);
+
+	ipv6h->nexthdr = psph->nexthdr;
+	ipv6h->payload_len =
+		htons(ntohs(ipv6h->payload_len) - sizeof(struct psp_insert));
+
+	memmove(skb->data + sizeof(struct psp_insert), skb->data, depth);
+	skb_pull(skb, sizeof(struct psp_insert));
+	skb->mac_len = ETH_HLEN;
+	skb_mac_header_rebuild(skb);
+
+	skb->decrypted = 1;
+
+	u64_stats_update_begin(&ns->syncp);
+	ns->psp.rx_packets++;
+	ns->psp.rx_bytes += skb->len;
 	u64_stats_update_end(&ns->syncp);
 
 	return 0;
@@ -153,7 +190,7 @@ nsim_rx_spi_alloc(struct psp_dev *psd, u32 version,
 	int i;
 
 	new = ++ns->psp.spi & PSP_SPI_KEY_ID;
-	if (psd->generation & 1)
+	if (ns->psp.generation & 1)
 		new |= PSP_SPI_KEY_PHASE;
 
 	assoc->spi = cpu_to_be32(new);
@@ -182,7 +219,12 @@ static int nsim_assoc_add(struct psp_dev *psd, struct psp_assoc *pas,
 
 static int nsim_key_rotate(struct psp_dev *psd, struct netlink_ext_ack *extack)
 {
+	struct netdevsim *ns = psd->drv_priv;
+
 	pr_info("PSP key rotation\n");
+
+	psd->generation = 0;
+	++ns->psp.generation;
 
 	return 0;
 }
