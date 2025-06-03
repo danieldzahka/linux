@@ -128,7 +128,7 @@ static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (!peer_ns)
 		goto out_drop_any;
 
-	if (skb->decrypted) {
+	if (skb_is_decrypted(skb)) {
 		dr = nsim_do_psp(skb, ns, peer_ns);
 		if (dr)
 			goto out_drop_free;

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
+#include <net/ip.h>
 #include <net/psp.h>
 #include <net/ip6_checksum.h>
 
@@ -15,7 +16,6 @@ enum skb_drop_reason nsim_do_psp(struct sk_buff *skb, struct netdevsim *ns,
 {
 	struct psp_insert *psp;
 	struct psp_assoc *pas;
-	struct ipv6hdr *ip6;
 	unsigned int offs;
 	void *start;
 	void **ptr;
@@ -27,7 +27,8 @@ enum skb_drop_reason nsim_do_psp(struct sk_buff *skb, struct netdevsim *ns,
 	if (likely(!pas))
 		goto out_unlock;
 
-	if (skb->protocol != htons(ETH_P_IPV6)) {
+	if (skb->protocol != htons(ETH_P_IPV6) &&
+	    skb->protocol != htons(ETH_P_IP)) {
 		rc = SKB_DROP_REASON_PSP_OUTPUT;
 		goto out_unlock;
 	}
@@ -58,13 +59,18 @@ enum skb_drop_reason nsim_do_psp(struct sk_buff *skb, struct netdevsim *ns,
 	skb->transport_header	-= sizeof(*psp);
 
 	psp = start + offs;
-
 	memmove(start, start + sizeof(*psp), offs);
-
-	ip6 = ipv6_hdr(skb);
 	skb_set_inner_ipproto(skb, IPPROTO_TCP);
-	ip6->nexthdr = IPPROTO_UDP;
-	be16_add_cpu(&ip6->payload_len, sizeof(*psp));
+
+	if (skb->protocol == htons(ETH_P_IP)) {
+		ip_hdr(skb)->protocol = IPPROTO_UDP;
+		be16_add_cpu(&ip_hdr(skb)->tot_len, sizeof(*psp)); // adjust with trailer
+		ip_hdr(skb)->check = 0;
+		ip_hdr(skb)->check = ip_fast_csum((u8 *)ip_hdr(skb), ip_hdr(skb)->ihl);
+	} else {
+		ipv6_hdr(skb)->nexthdr = IPPROTO_UDP;
+		be16_add_cpu(&ipv6_hdr(skb)->payload_len, sizeof(*psp)); // adjust with trailer
+	}
 
 	skb_set_inner_transport_header(skb, skb_transport_offset(skb) +
 						    sizeof(*psp));
@@ -95,25 +101,34 @@ out_unlock:
 
 bool nsim_rx_skb_is_psp(struct sk_buff *skb, u32 ver_ena)
 {
-	int header_len = sizeof(struct ipv6hdr) + sizeof(struct psp_insert);
-	const struct udphdr *uh;
-	const struct psphdr *ph;
+	const struct udphdr *pudp;
+	const struct psphdr *psph;
+	int l3_hlen;
+	int l4_off;
+	u8 proto;
 
-	if (skb->protocol != htons(ETH_P_IPV6))
+	if (skb->protocol != htons(ETH_P_IPV6) &&
+	    skb->protocol != htons(ETH_P_IP))
 		return false;
 
-	if (header_len > skb_headlen(skb))
+	l3_hlen = skb->protocol == htons(ETH_P_IP) ? ip_hdrlen(skb) :
+						     sizeof(struct ipv6hdr);
+	proto = skb->protocol == htons(ETH_P_IP) ? ip_hdr(skb)->protocol :
+						   ipv6_hdr(skb)->nexthdr;
+	l4_off = l3_hlen + sizeof(struct psp_insert);
+
+	if (l4_off > skb_headlen(skb))
 		return false;
 
-	if (ipv6_hdr(skb)->nexthdr != IPPROTO_UDP)
+	if (proto != IPPROTO_UDP)
 		return false;
 
-	uh = (const struct udphdr *)(skb->data + sizeof(struct ipv6hdr));
-	if (uh->dest != htons(PSP_DEFAULT_UDP_PORT))
+	pudp = (const struct udphdr *)(skb->data + l3_hlen);
+	if (pudp->dest != htons(PSP_DEFAULT_UDP_PORT))
 		return false;
 
-	ph = (const struct psphdr *)(uh + 1);
-	if (ph->nexthdr != IPPROTO_TCP)
+	psph = (const struct psphdr *)(pudp + 1);
+	if (psph->nexthdr != IPPROTO_TCP)
 		return false;
 
 	/* PACKETDRILL HACK: the wire_server needs to see non-decapsulated PSP
@@ -121,44 +136,58 @@ bool nsim_rx_skb_is_psp(struct sk_buff *skb, u32 ver_ena)
 	 * versions on the wire_server netdevsim, and include the branch below
 	 * instead of dropping the packet.
 	 */
-	if (!((1 << FIELD_GET(PSPHDR_VERFL_VERSION, ph->verfl)) & ver_ena))
+	if (!((1 << FIELD_GET(PSPHDR_VERFL_VERSION, psph->verfl)) & ver_ena))
 		return false;
 
 	return true;
 }
 
+static void psp_fixup_ip4(struct iphdr *iph, struct psphdr *psph)
+{
+	iph->protocol = psph->nexthdr;
+	iph->tot_len = htons(ntohs(iph->tot_len) - sizeof(struct psp_insert));
+	iph->check = 0;
+	iph->check = ip_fast_csum((u8 *)iph, iph->ihl);
+}
+
+static void psp_fixup_ip6(struct ipv6hdr *ipv6h, struct psphdr *psph)
+{
+	ipv6h->nexthdr = psph->nexthdr;
+	ipv6h->payload_len =
+		htons(ntohs(ipv6h->payload_len) - sizeof(struct psp_insert));
+}
+
 int nsim_psp_handle_rx_skb(struct sk_buff *skb, struct netdevsim *ns)
 {
-	const struct psphdr *psph;
-	int depth = 0, end_depth;
 	struct psp_skb_ext *pse;
-	struct ipv6hdr *ipv6h;
+	int tcp_off, l3_hlen;
+	struct psphdr *psph;
 	u32 spi;
 
-	ipv6h = (struct ipv6hdr *)skb->data;
-	depth = sizeof(*ipv6h);
-	end_depth = depth + sizeof(struct udphdr) + sizeof(struct psphdr);
+	l3_hlen = skb->protocol == htons(ETH_P_IP) ? ip_hdrlen(skb) :
+						     sizeof(struct ipv6hdr);
+	tcp_off = l3_hlen + sizeof(struct psp_insert);
 
-	if (unlikely(end_depth > skb_headlen(skb)))
+	if (unlikely(tcp_off > skb_headlen(skb)))
 		return -EINVAL;
 
 	pse = skb_ext_add(skb, SKB_EXT_PSP);
 	if (!pse)
 		return -EINVAL;
 
-	psph = (const struct psphdr *)(skb->data + depth +
-				       sizeof(struct udphdr));
+	psph = (struct psphdr *)(skb->data + l3_hlen + sizeof(struct udphdr));
 	pse->spi = psph->spi;
 	pse->dev_id = ns->psp.dev->id;
 	spi = ntohl(psph->spi);
 	pse->generation = 0;
 	pse->version = FIELD_GET(PSPHDR_VERFL_VERSION, psph->verfl);
 
-	ipv6h->nexthdr = psph->nexthdr;
-	ipv6h->payload_len =
-		htons(ntohs(ipv6h->payload_len) - sizeof(struct psp_insert));
+	if (skb->protocol == htons(ETH_P_IP))
+		psp_fixup_ip4(ip_hdr(skb), psph);
+	else
+		psp_fixup_ip6(ipv6_hdr(skb), psph);
 
-	memmove(skb->data + sizeof(struct psp_insert), skb->data, depth);
+	memmove(skb->data + sizeof(struct psp_insert), skb->data, l3_hlen);
 	skb_pull(skb, sizeof(struct psp_insert));
 	skb->mac_len = ETH_HLEN;
 	skb_mac_header_rebuild(skb);
