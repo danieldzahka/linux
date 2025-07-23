@@ -393,7 +393,7 @@ static int nsim_get_iflink(const struct net_device *dev)
 	return iflink;
 }
 
-static int nsim_rcv(struct nsim_rq *rq, int budget, struct netdevsim *ns)
+static int nsim_rcv(struct nsim_rq *rq, int budget)
 {
 	struct net_device *dev = rq->napi.dev;
 	struct bpf_prog *xdp_prog;
@@ -448,10 +448,9 @@ static int nsim_rcv(struct nsim_rq *rq, int budget, struct netdevsim *ns)
 static int nsim_poll(struct napi_struct *napi, int budget)
 {
 	struct nsim_rq *rq = container_of(napi, struct nsim_rq, napi);
-	struct netdevsim *ns = netdev_priv(napi->dev);
 	int done;
 
-	done = nsim_rcv(rq, budget, ns);
+	done = nsim_rcv(rq, budget);
 	if (done < budget)
 		napi_complete_done(napi, done);
 
