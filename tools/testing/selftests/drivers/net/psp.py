@@ -17,6 +17,14 @@ class PSPExceptShortIO(Exception):
     pass
 
 
+def psp_ver_keylen(version):
+        if version == 0 or version == 2:
+            return 16
+        elif version == 1 or version == 3:
+            return 32
+        raise Exception(f"psp_ver_keylen(): bad version: {version}")
+
+
 def _get_outq(s):
     one = b'\0' * 4
     outq = fcntl.ioctl(s.fileno(), termios.TIOCOUTQ, one)
@@ -54,6 +62,19 @@ def _close_conn(cfg, s):
 
 def _close_psp_conn(cfg, s):
     _close_conn(cfg, s)
+
+
+def _provide_spi(cfg, version):
+    _send_with_ack(cfg, b'provide spi\0')
+    tx = cfg.comm_sock.recv(4 + psp_ver_keylen(version))
+    return {
+        'spi': struct.unpack('I', tx[:4])[0],
+        'key': tx[4:]
+    }
+
+
+def _use_spi(cfg, rx):
+    _send_with_ack(cfg, b'use spi\0' + struct.pack('I', rx['spi']) + rx['key'])
 
 
 def _spi_xchg(s, rx):
@@ -329,8 +350,7 @@ def assoc_twice(cfg):
         s.close()
 
 
-def data_basic_send(cfg, version=0):
-    """ Test basic data send """
+def make_psp_conn(cfg, version):
     # Version 0 is required by spec, don't let it skip
     if version:
         name = cfg.pspnl.consts["version"].entries_by_val[version].name
@@ -355,7 +375,12 @@ def data_basic_send(cfg, version=0):
                         "version": version,
                         "tx-key": tx,
                         "sock-fd": s.fileno()})
+    return s
 
+def data_basic_send(cfg, version=0):
+    """ Test basic data send """
+
+    s = make_psp_conn(cfg, version)
     data_len = _send_careful(cfg, s, 100)
     _check_data_rx(cfg, data_len)
     _close_psp_conn(cfg, s)
@@ -371,6 +396,74 @@ def data_basic_send_v2(cfg):
 
 def data_basic_send_v3(cfg):
     data_basic_send(cfg, version=3)
+
+
+def data_basic_rx_rekey(cfg, version=0):
+    """ Test basic rx rekey """
+
+    s = make_psp_conn(cfg, version)
+    data_len = _send_careful(cfg, s, 100)
+    _check_data_rx(cfg, data_len)
+
+    for _ in range(10):
+        rx_assoc = cfg.pspnl.rx_assoc({"version": version,
+                                "dev-id": cfg.psp_dev_id,
+                                "sock-fd": s.fileno()})
+        rx = rx_assoc['rx-key']
+        _use_spi(cfg, rx)
+        _req_echo(cfg, s)
+
+
+def data_basic_tx_rekey(cfg, version=0):
+    """ Test basic rx rekey """
+
+    s = make_psp_conn(cfg, version)
+    data_len = _send_careful(cfg, s, 1)
+    _check_data_rx(cfg, data_len)
+
+    for _ in range(10):
+        tx = _provide_spi(cfg, version)
+        cfg.pspnl.tx_assoc({"dev-id": cfg.psp_dev_id,
+                            "version": version,
+                            "tx-key": tx,
+                            "sock-fd": s.fileno()})
+        data_len += _send_careful(cfg, s, 1)
+        _check_data_rx(cfg, data_len)
+
+
+def data_rekey_and_rotate(cfg, version=0):
+    """Test a mix of key rotations and rekey operations"""
+
+    s = make_psp_conn(cfg, version)
+    data_len = _send_careful(cfg, s, 1)
+    _check_data_rx(cfg, data_len)
+
+    rounds = 3
+    tx_rekeys_per_round = 2
+
+    for _ in range(rounds):
+        cfg.pspnl.key_rotate({"id": cfg.psp_dev_id})
+
+        # receive data on rotated key
+        _req_echo(cfg, s)
+
+        # rekey and receive data on active key
+        rx_assoc = cfg.pspnl.rx_assoc({"version": version,
+                                       "dev-id": cfg.psp_dev_id,
+                                       "sock-fd": s.fileno()})
+        rx = rx_assoc['rx-key']
+        _use_spi(cfg, rx)
+        _req_echo(cfg, s)
+
+        # perform an arbitrary number of tx rekeys
+        for _ in range(tx_rekeys_per_round):
+            tx = _provide_spi(cfg, version)
+            cfg.pspnl.tx_assoc({"dev-id": cfg.psp_dev_id,
+                                "version": version,
+                                "tx-key": tx,
+                                "sock-fd": s.fileno()})
+            data_len += _send_careful(cfg, s, 1)
+            _check_data_rx(cfg, data_len)
 
 
 def __bad_xfer_do(cfg, s, tx, version='hdr0-aes-gcm-128'):
