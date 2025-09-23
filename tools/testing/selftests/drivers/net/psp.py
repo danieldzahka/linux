@@ -24,6 +24,10 @@ from lib.py import bkg, rand_port, wait_port_listen
 from lib.py import ip
 
 
+class PSPExceptShortIO(Exception):
+    """ Exception for short IO when reading from PSP socket """
+
+
 def _get_outq(s):
     one = b'\0' * 4
     outq = fcntl.ioctl(s.fileno(), termios.TIOCOUTQ, one)
@@ -92,6 +96,29 @@ def _send_careful(cfg, s, rounds):
             raise RuntimeError(report)
 
     return len(data) * rounds
+
+
+def _recv_careful(s, target, rounds=100):
+    data = b''
+    for _ in range(rounds):
+        try:
+            data += s.recv(target - len(data), socket.MSG_DONTWAIT)
+            if len(data) == target:
+                return data
+        except BlockingIOError:
+            time.sleep(0.001)
+    raise PSPExceptShortIO(target, len(data), data)
+
+
+def _req_echo(cfg, s, expect_fail=False):
+    _send_with_ack(cfg, b'data echo\0')
+    try:
+        _recv_careful(s, 5)
+        if expect_fail:
+            raise Exception("Received unexpected echo reply")
+    except PSPExceptShortIO:
+        if not expect_fail:
+            raise
 
 
 def _check_data_rx(cfg, exp_len):
@@ -523,6 +550,72 @@ def data_stale_key(cfg):
         _close_psp_conn(cfg, s)
 
 
+def _get_psp_ver_ip_variants():
+    for ver in range(4):
+        for ipv in ("4", "6"):
+            yield KsftNamedVariant(f"v{ver}_ip{ipv}", ver, ipv)
+
+
+def _get_ip_variants():
+    for ipv in ("4", "6"):
+        yield KsftNamedVariant(f"ip{ipv}", ipv)
+
+
+@ksft_variants(_get_ip_variants())
+def data_send_off(cfg, ipver):
+    """ Test data send when PSP is turned off """
+    cfg.require_ipver(ipver)
+
+    _init_psp_dev(cfg)
+
+    s = info = udps = None
+    try:
+        s = _make_psp_conn(cfg, ipver=ipver)
+
+        rx_assoc = cfg.pspnl.rx_assoc({"version": 0,
+                                     "dev-id": cfg.psp_dev_id,
+                                     "sock-fd": s.fileno()})
+        tx = _spi_xchg(s, rx_assoc['rx-key'])
+        cfg.pspnl.tx_assoc({"dev-id": cfg.psp_dev_id,
+                          "version": 0,
+                          "tx-key": tx,
+                          "sock-fd": s.fileno()})
+
+        _req_echo(cfg, s)
+
+        info = cfg.pspnl.dev_get({"id": cfg.psp_dev_id})
+        cfg.pspnl.dev_set({"id": cfg.psp_dev_id,
+                         "psp-versions-ena": 0})
+
+        # Try to catch the still-encapsulated PSP packets on a UDP socket
+        if ipver == "4":
+            udps = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udps.bind(('0.0.0.0', 1000))
+        else:
+            udps = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            udps.bind(('::', 1000))
+        wait_port_listen(1000, proto="udp")
+
+        _req_echo(cfg, s, expect_fail=True)
+
+        cfg.pspnl.dev_set({"id": cfg.psp_dev_id,
+                         "psp-versions-ena": info['psp-versions-ena']})
+        info = None
+        # We need some more TCP RTOs so lots of rounds
+        _recv_careful(s, 5, rounds=350)
+
+        # Will raise BlockingIOError if there are no packets
+        udps.recv(8192, socket.MSG_DONTWAIT)
+    finally:
+        if s:
+            _close_psp_conn(cfg, s)
+        if info:
+            cfg.pspnl.dev_set({"id": cfg.psp_dev_id,
+                             "psp-versions-ena": info['psp-versions-ena']})
+        if udps:
+            udps.close()
+
+
 def __nsim_psp_rereg(cfg):
     # The PSP dev ID will change, remember what was there before
     before = set([x['id'] for x in cfg.pspnl.dev_get({}, dump=True)])
@@ -576,17 +669,6 @@ def removal_device_bi(cfg):
         __nsim_psp_rereg(cfg)
     finally:
         _close_conn(cfg, s)
-
-
-def _get_psp_ver_ip_variants():
-    for ver in range(4):
-        for ipv in ("4", "6"):
-            yield KsftNamedVariant(f"v{ver}_ip{ipv}", ver, ipv)
-
-
-def _get_ip_variants():
-    for ipv in ("4", "6"):
-        yield KsftNamedVariant(f"ip{ipv}", ipv)
 
 
 @ksft_variants(_get_psp_ver_ip_variants())
@@ -973,7 +1055,7 @@ def main() -> None:
                                                           cfg.comm_port),
                                                          timeout=1)
 
-                cases = [data_basic_send, data_mss_adjust]
+                cases = [data_basic_send, data_mss_adjust, data_send_off]
 
                 if has_cont:
                     cases += [
