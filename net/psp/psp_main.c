@@ -3,6 +3,7 @@
 #include <linux/bitfield.h>
 #include <linux/list.h>
 #include <linux/netdevice.h>
+#include <linux/slab.h>
 #include <linux/xarray.h>
 #include <net/net_namespace.h>
 #include <net/psp.h>
@@ -88,13 +89,16 @@ psp_dev_create(struct net_device *netdev,
 	INIT_LIST_HEAD(&psd->stale_assocs);
 	refcount_set(&psd->refcnt, 1);
 
+	err = psp_deferred_del_init(psd);
+	if (err)
+		goto err_free_psd;
+
 	mutex_lock(&psp_devs_lock);
 	err = xa_alloc_cyclic(&psp_devs, &psd->id, psd, xa_limit_16b,
 			      &last_id, GFP_KERNEL);
 	if (err) {
 		mutex_unlock(&psp_devs_lock);
-		kfree(psd);
-		return ERR_PTR(err);
+		goto err_cleanup_deferred_del;
 	}
 	mutex_lock(&psd->lock);
 	mutex_unlock(&psp_devs_lock);
@@ -110,6 +114,12 @@ psp_dev_create(struct net_device *netdev,
 	mutex_unlock(&psd->lock);
 
 	return psd;
+
+err_cleanup_deferred_del:
+	psp_deferred_del_cleanup(psd, true);
+err_free_psd:
+	kfree(psd);
+	return ERR_PTR(err);
 }
 EXPORT_SYMBOL(psp_dev_create);
 
@@ -132,6 +142,8 @@ void psp_dev_unregister(struct psp_dev *psd)
 	struct psp_assoc_dev *entry, *entry_tmp;
 	struct psp_assoc *pas, *next;
 
+	psp_deferred_del_stop(psd);
+
 	mutex_lock(&psp_devs_lock);
 	mutex_lock(&psd->lock);
 
@@ -143,6 +155,8 @@ void psp_dev_unregister(struct psp_dev *psd)
 	 */
 	xa_store(&psp_devs, psd->id, NULL, GFP_KERNEL);
 	mutex_unlock(&psp_devs_lock);
+
+	psp_deferred_del_cleanup(psd, false);
 
 	list_splice_init(&psd->active_assocs, &psd->prev_assocs);
 	list_splice_init(&psd->prev_assocs, &psd->stale_assocs);

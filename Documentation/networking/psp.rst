@@ -172,6 +172,36 @@ Drivers must use ``psp_skb_get_assoc_rcu()`` to check if PSP Tx offload
 was requested for given skb. On Rx drivers should allocate and populate
 the ``SKB_EXT_PSP`` skb extension, and set the skb->decrypted bit to 1.
 
+Deferred Tx key deletion
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Drivers which implement ``tx_key_add`` and ``tx_key_del`` may hold key
+references in their Tx rings, so PSP core waits until descriptors
+containing these references are completed before removing the key from
+the underlying device. PSP core uses accounting based on Byte Queue Limits
+(BQL) to wait for a suitable grace period before asking the driver to
+remove the key.
+
+Drivers which implement the Tx key callbacks must meet the following
+requirements:
+
+* A PSP skb accepted by ``ndo_start_xmit()`` must remain socket-owned until
+  every Tx descriptor referencing its PSP key has been completed or otherwise
+  made incapable of using the key. The driver must not orphan the skb before
+  that point. Otherwise, the socket destructor may free the Tx key while key
+  references remain in the Tx ring.
+* Every PSP packet accepted by ``ndo_start_xmit()`` must be included in BQL
+  queued bytecount before the function returns.
+* Completion bytecounts must exactly match enqueue bytecounts and preserve
+  queue order. A later packet must not be reported as completed while an earlier
+  packet can still reference its key.
+* Before calling ``dql_reset()`` on a queue, the driver must ensure that all
+  outstanding descriptors containing key references have been completed or
+  discarded.
+* The BQL state of an inactive or removed queue must reflect all bytes
+  completed or be reset after the queue has been quiesced. Failure to do so
+  will stall the grace period algorithm.
+
 Kernel implementation notes
 ---------------------------
 

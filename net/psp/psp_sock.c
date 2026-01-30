@@ -118,8 +118,14 @@ static void psp_assoc_free(struct work_struct *work)
 
 	mutex_lock(&psd->lock);
 	if (psp_dev_is_registered(psd)) {
-		if (psp_assoc_needs_tx_key_del(pas))
+		if (psp_assoc_needs_tx_key_del(pas)) {
+			if (pas->flags & PSP_ASSOC_DEFER_TX_KEY_DEL) {
+				psp_deferred_del_queue(psd, pas);
+				mutex_unlock(&psd->lock);
+				return;
+			}
 			psp_dev_tx_key_del(psd, pas);
+		}
 		list_del(&pas->assocs_list);
 	}
 	mutex_unlock(&psd->lock);
@@ -314,6 +320,7 @@ psp_sock_tx_rekey(struct sock *sk, struct psp_dev *psd, struct psp_assoc *pas,
 	list_add(&new->assocs_list, &pas->assocs_list);
 
 	rcu_assign_pointer(sk->psp_assoc, new);
+	pas->flags |= PSP_ASSOC_DEFER_TX_KEY_DEL;
 	psp_assoc_put(pas);
 
 	return 0;
