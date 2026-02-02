@@ -83,6 +83,7 @@ struct psp_assoc_dev {
  * @stats:	statistics maintained by the core
  * @stats.rotations:	See stats attr key-rotations
  * @stats.stales:	See stats attr stale-events
+ * @stats.tx_key_cnt:	See stats attr tx-key-cnt
  *
  * @rcu:	RCU head for freeing the structure
  */
@@ -111,6 +112,7 @@ struct psp_dev {
 	struct {
 		unsigned long rotations;
 		unsigned long stales;
+		unsigned long tx_key_cnt;
 	} stats;
 
 	struct rcu_head rcu;
