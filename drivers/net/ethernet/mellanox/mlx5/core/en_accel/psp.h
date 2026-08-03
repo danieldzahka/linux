@@ -26,7 +26,6 @@ struct mlx5e_psp {
 	struct psp_dev *psd;
 	struct psp_dev_caps caps;
 	struct mlx5e_psp_fs *fs;
-	atomic_t tx_key_cnt;
 	atomic_t tx_drop;
 };
 

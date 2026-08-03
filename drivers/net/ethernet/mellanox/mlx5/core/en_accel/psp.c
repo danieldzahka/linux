@@ -938,7 +938,6 @@ static int mlx5e_psp_assoc_add(struct psp_dev *psd, struct psp_assoc *pas,
 	struct mlx5e_priv *priv = netdev_priv(psd->main_netdev);
 	struct mlx5_core_dev *mdev = priv->mdev;
 	struct psp_key_parsed *tx = &pas->tx;
-	struct mlx5e_psp *psp = priv->psp;
 	struct psp_key *nkey;
 	int err;
 
@@ -954,19 +953,16 @@ static int mlx5e_psp_assoc_add(struct psp_dev *psd, struct psp_assoc *pas,
 		return err;
 	}
 
-	atomic_inc(&psp->tx_key_cnt);
 	return 0;
 }
 
 static void mlx5e_psp_assoc_del(struct psp_dev *psd, struct psp_assoc *pas)
 {
 	struct mlx5e_priv *priv = netdev_priv(psd->main_netdev);
-	struct mlx5e_psp *psp = priv->psp;
 	struct psp_key *nkey;
 
 	nkey = (struct psp_key *)pas->drv_data;
 	mlx5_destroy_encryption_key(priv->mdev, nkey->id);
-	atomic_dec(&psp->tx_key_cnt);
 }
 
 static int mlx5e_psp_rotate_key(struct mlx5_core_dev *mdev)
@@ -1111,7 +1107,6 @@ void mlx5e_psp_cleanup(struct mlx5e_priv *priv)
 	if (!psp)
 		return;
 
-	WARN_ON(atomic_read(&psp->tx_key_cnt));
 	mlx5e_accel_psp_fs_cleanup(psp->fs);
 	priv->psp = NULL;
 	kfree(psp);
