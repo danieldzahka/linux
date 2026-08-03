@@ -10,9 +10,11 @@
 #include "psp.h"
 
 #define PSP_TX_GRACE_POLL_MS	1000
+#define PSP_TX_GRACE_STALL_THRESHOLD	10
 
 struct psp_txq_state {
 	unsigned int num_tx_queues;
+	unsigned int stalled;
 	unsigned long *drained_queues;
 	unsigned int to_complete[];
 };
@@ -64,6 +66,28 @@ static void psp_tx_grace_start(struct psp_dev *psd)
 
 		state->to_complete[i] = READ_ONCE(txq->dql.num_queued);
 	}
+
+	state->stalled = 0;
+}
+
+static bool psp_tx_grace_stalled(struct psp_dev *psd)
+{
+	struct psp_txq_state *state = psd->tx_del.txq_state;
+	unsigned int first, stuck;
+
+	if (state->stalled < PSP_TX_GRACE_STALL_THRESHOLD)
+		return false;
+
+	stuck = state->num_tx_queues -
+		bitmap_weight(state->drained_queues, state->num_tx_queues);
+	first = find_first_zero_bit(state->drained_queues,
+				    state->num_tx_queues);
+
+	netdev_warn(psd->main_netdev,
+		    "psp: no Tx key deletion grace period progress for %u polls, %u of %u queues did not drain (first stuck queue %u). Deleting keys anyway.\n",
+		    state->stalled, stuck, state->num_tx_queues, first);
+
+	return true;
 }
 
 static bool psp_tx_grace_done(struct psp_dev *psd)
@@ -71,6 +95,7 @@ static bool psp_tx_grace_done(struct psp_dev *psd)
 	struct psp_txq_state *state = psd->tx_del.txq_state;
 	struct net_device *dev = psd->main_netdev;
 	bool all_completed = true;
+	bool stalled = true;
 	unsigned int i;
 
 	for (i = 0; i < state->num_tx_queues; i++) {
@@ -107,11 +132,18 @@ static bool psp_tx_grace_done(struct psp_dev *psd)
 		queued = READ_ONCE(txq->dql.num_queued);
 
 		if ((int)(state->to_complete[i] - completed) <= 0 ||
-		    (int)(state->to_complete[i] - queued) > 0)
+		    (int)(state->to_complete[i] - queued) > 0) {
 			__set_bit(i, state->drained_queues);
-		else
+			stalled = false;
+		} else {
 			all_completed = false;
+		}
 	}
+
+	if (stalled)
+		state->stalled++;
+	else
+		state->stalled = 0;
 
 	return all_completed;
 }
@@ -133,7 +165,8 @@ static void psp_deferred_del_work(struct work_struct *work)
 
 	mutex_lock(&psd->lock);
 
-	if (psp_tx_grace_active(psd) && psp_tx_grace_done(psd)) {
+	if (psp_tx_grace_active(psd) &&
+	    (psp_tx_grace_done(psd) || psp_tx_grace_stalled(psd))) {
 		list_splice_init(&psd->tx_del.active, &to_free);
 		list_for_each_entry(pas, &to_free, assocs_list)
 			psp_dev_tx_key_del(psd, pas);
